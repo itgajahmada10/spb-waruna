@@ -1,0 +1,649 @@
+{
+  "name": "SPB",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "\n// ── PN INDEX LOOKUP (dari GitHub via Get PN Index node) ──────────────────────\nconst pnIndexInput = items.find(i => i.json && i.json._meta);\nconst pnIndex = pnIndexInput ? (pnIndexInput.json.parts || {}) : {};\n\nfunction lookupPN(partNo) {\n  if (!partNo || !pnIndex[partNo]) return null;\n  const d = Array.isArray(pnIndex[partNo]) ? pnIndex[partNo][0] : pnIndex[partNo];\n  return {\n    fig_no    : d.fig_no,\n    fig_name  : d.fig_name,\n    page      : d.page,\n    ref_no    : d.ref_no,\n    part_name_manual: d.part_name,\n    // Ganti DRIVE_FILE_ID dengan ID file manual PDF di Google Drive\n    drive_link: \\`https://drive.google.com/file/d/DRIVE_FILE_ID/preview#page=\\${d.page}\\`,\n  };\n}\n// ─────────────────────────────────────────────────────────────────────────────\n\nconst inputs = $input.all();\n\nlet requestData   = [];\nlet rhData        = [];\nlet mandatoryData = [];\nlet reqHeader     = { vessel: \"-\", department: \"-\", approver: \"-\", date: \"-\", engine: \"-\" };\n\n// ─── Ambil engine_type dari Webhook ───────────────────────────────────────\ntry {\n    const wb = $('Webhook').first().json;\n    if (wb?.body?.engine_type) reqHeader.engine = wb.body.engine_type;\n} catch(e) {}\n\n// ─── Parse semua input ────────────────────────────────────────────────────\ninputs.forEach(input => {\n    const json = input.json;\n\n    // Ambil engine_type jika ada\n    if (json?.body?.engine_type && reqHeader.engine === \"-\") {\n        reqHeader.engine = json.body.engine_type;\n    }\n\n    let dataArray = [];\n    let parsedObj = null;\n\n    // Format: output Gemini (content.parts[0].text)\n    if (json?.content?.parts?.[0]?.text) {\n        try {\n            const clean = json.content.parts[0].text.replace(/```json/g,'').replace(/```/g,'').trim();\n            parsedObj = JSON.parse(clean);\n            dataArray = Array.isArray(parsedObj) ? parsedObj : (parsedObj.extracted_items || [parsedObj]);\n        } catch(e) {}\n    }\n    // Format: sudah jadi object dengan extracted_items\n    else if (json?.extracted_items && Array.isArray(json.extracted_items)) {\n        parsedObj = json;\n        dataArray  = json.extracted_items;\n    }\n    // Format: array langsung (dari Extract from File / mandatory xlsx)\n    else if (Array.isArray(json)) {\n        dataArray = json;\n    }\n    // Format: object tunggal\n    else {\n        parsedObj = json;\n        dataArray = [json];\n    }\n\n    // Tangkap header dokumen dari parsedObj\n    if (parsedObj && !Array.isArray(parsedObj)) {\n        if (parsedObj.vessel)     reqHeader.vessel     = parsedObj.vessel;\n        if (parsedObj.department) reqHeader.department = parsedObj.department;\n        if (parsedObj.approver)   reqHeader.approver   = parsedObj.approver;\n        if (parsedObj.date)       reqHeader.date        = parsedObj.date;\n        else if (parsedObj.tanggal) reqHeader.date      = parsedObj.tanggal;\n    }\n\n    // Routing: masuk ke bucket mana?\n    dataArray.flat().forEach(row => {\n        if (row[\"MAXIMUM REQUEST\"] !== undefined || row[\"+SPARE\"] !== undefined) {\n            mandatoryData.push(row);\n        } else if (row.cyl_1 !== undefined || row[\"cyl_1\"] !== undefined) {\n            rhData.push(row);\n        } else if (row.item_name !== undefined || row.req !== undefined || row.rob !== undefined) {\n            requestData.push(row);\n            if (row.vessel     && reqHeader.vessel     === \"-\") reqHeader.vessel     = row.vessel;\n            if (row.department && reqHeader.department === \"-\") reqHeader.department = row.department;\n            if (row.approver   && reqHeader.approver   === \"-\") reqHeader.approver   = row.approver;\n        }\n    });\n});\n\n// ─── Guard: pastikan semua data tersedia ──────────────────────────────────\nif (requestData.length === 0)  return [{json:{PESAN_ERROR:\"❌ Data Permintaan gagal dibongkar dari PDF!\"}}];\nif (mandatoryData.length === 0) return [{json:{PESAN_ERROR:\"❌ Data Mandatory tidak terdeteksi! Pastikan file Mandatory_[engine].xlsx tersedia di Drive.\"}}];\nif (rhData.length === 0)        return [{json:{PESAN_ERROR:\"⚠️ Data Running Hours kosong! Cek PDF Running Hours atau response Gemini.\"}}];\n\n// ─── STEP 1: Filter — hanya item yang master_category cocok dengan Mandatory ─\n// Filosofi baru: matching sudah dilakukan Gemini → JS hanya exact match string\nconst matched = [];\n\nrequestData.forEach(reqItem => {\n    if (!reqItem.item_name) return;\n\n    const reqQty = parseFloat(reqItem.req) || 0;\n    if (reqQty <= 0) return;\n\n    // master_category dari Gemini harus exact match dengan \"Item Name\" di Mandatory\n    const reqCat = (reqItem.master_category || \"\").toString().trim().toUpperCase();\n    if (!reqCat || reqCat === \"-\") return; // skip item non-mandatory\n\n    const masterRow = mandatoryData.find(m => {\n        const mName = (m[\"Item Name\"] || \"\").toString().trim().toUpperCase();\n        return mName !== \"\" && mName === reqCat;\n    });\n\n    if (!masterRow) return; // tidak ada di Mandatory → skip\n\n    matched.push({\n        req_no:       reqItem.no || \"-\",\n        req_name:     reqItem.item_name,\n        req_maker:    reqItem.maker || \"-\",\n        req_subsystem: reqItem.subsystem || \"-\",\n        master_name:  masterRow[\"Item Name\"],\n        qty_req:      reqQty,\n        rob:          parseFloat(reqItem.rob) || 0,\n        max_req:      parseFloat(masterRow[\"MAXIMUM REQUEST\"]) || 0,\n        spare:        parseFloat(masterRow[\"+SPARE\"]) || 0,\n        item_code:    masterRow[\"Item Code\"] || \"-\",\n    });\n});\n\nif (matched.length === 0) {\n    return [{json:{PESAN_ERROR:\"⚠️ Tidak ada item yang cocok dengan Mandatory. Cek hasil master_category dari Gemini.\"}}];\n}\n\n// ─── STEP 2: Hitung qty final + cari RH sebagai bukti pendukung ──────────\n// Qty final = min(Net Req, Max Allowed)\n// RH = informasi pendukung saja, tidak mempengaruhi qty\n\nconst totalCylinders = 6;\n\nconst finalData = matched.map((item, idx) => {\n    const rob       = item.rob;\n    const netReq    = Math.max(item.qty_req - rob, 0);\n    const maxAllowed = Math.max((item.max_req + item.spare) - rob, 0);\n    const finalQty  = Math.min(netReq, maxAllowed);\n\n    let logicLabel = \"\";\n    let rowColor   = \"green\";\n    if (netReq > maxAllowed) {\n        logicLabel = `Dipangkas: Net Req (${netReq}) > Limit (${maxAllowed}). Final = ${finalQty}`;\n        rowColor   = \"yellow\";\n    } else if (netReq === 0) {\n        logicLabel = `Net Req = 0 (ROB sudah cukup).`;\n        rowColor   = \"blue\";\n    } else {\n        logicLabel = `Normal. Final = ${finalQty}`;\n        rowColor   = \"green\";\n    }\n\n    // ── Cari RH yang relevan (exact match nama master, sudah dinormalisasi Gemini) ──\n    const masterNameUpper = item.master_name.toString().toUpperCase().trim();\n    const rhRow = rhData.find(rh => {\n        const rhDesc = (rh.deskripsi || \"\").toString().toUpperCase().trim();\n        return rhDesc === masterNameUpper;\n    }) || null;\n\n    // Susun ringkasan RH per silinder\n    let rhSummary = [];\n    let unreadable = [];\n    if (rhRow) {\n        for (let i = 1; i <= totalCylinders; i++) {\n            const raw = rhRow[`cyl_${i}`];\n            if (raw === \"!\" || raw === \"-\" || raw === \"?\" || raw === \"N/A\" || raw === undefined || raw === null) {\n                rhSummary.push({ cyl: i, hours: null, status: \"⚠️ Tidak terbaca\" });\n                unreadable.push(i);\n            } else {\n                const hrs = parseFloat(raw) || 0;\n                rhSummary.push({ cyl: i, hours: hrs, status: hrs > 0 ? `${hrs} hrs` : \"0 hrs\" });\n            }\n        }\n    }\n\n    return {\n        no:            idx + 1,\n        item_code:     item.item_code,\n        master_name:   item.master_name,\n        req_no:        item.req_no,\n        req_name:      item.req_name,\n        req_maker:     item.req_maker,\n        req_subsystem: item.req_subsystem,\n        rob:           rob,\n        qty_req:       item.qty_req,\n        net_req:       netReq,\n        max_req:       item.max_req,\n        spare:         item.spare,\n        max_allowed:   maxAllowed,\n        final_qty:     finalQty,\n        logic_label:   logicLabel,\n        row_color:     rowColor,\n        rh_found:      rhRow !== null,\n        rh_desc:       rhRow ? rhRow.deskripsi : \"Tidak Terdeteksi\",\n        rh_summary:    rhSummary,\n        rh_unreadable: unreadable,\n    };\n});\n\n// ─── STEP 3: Build HTML Output ────────────────────────────────────────────\nconst colorMap = {\n    green:  { bg: \"#e9f7ef\", text: \"#1e8449\", border: \"#a9dfbf\" },\n    yellow: { bg: \"#fdf2e9\", text: \"#b9770e\", border: \"#fad7a0\" },\n    blue:   { bg: \"#eaf4fb\", text: \"#1a5276\", border: \"#a9cce3\" },\n};\n\nlet html = `\n<div style=\"font-family:'Inter',system-ui,sans-serif;font-size:13px;color:#333;max-width:1250px;margin:0 auto;\">\n\n<!-- HEADER INFO -->\n<div style=\"margin-bottom:20px;border:1px solid #e0e0e0;border-radius:8px;padding:15px;background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.02)\">\n  <table style=\"width:100%;border:none;border-collapse:collapse;font-size:14px;\">\n    <tr>\n      <td style=\"width:12%;color:#666;padding:4px 0\">Vessel</td><td style=\"width:2%\">:</td>\n      <td style=\"width:36%;font-weight:700\">${reqHeader.vessel}</td>\n      <td style=\"width:12%;color:#666\">Engine Type</td><td style=\"width:2%\">:</td>\n      <td style=\"color:#4A235A;font-weight:800;font-size:15px\">${reqHeader.engine}</td>\n    </tr>\n    <tr>\n      <td style=\"color:#666;padding:4px 0\">Department</td><td>:</td>\n      <td style=\"font-weight:600\">${reqHeader.department}</td>\n      <td style=\"color:#666\">Date</td><td>:</td>\n      <td style=\"font-weight:600\">${reqHeader.date}</td>\n    </tr>\n    <tr>\n      <td style=\"color:#666;padding:4px 0\">Approver</td><td>:</td>\n      <td colspan=\"4\" style=\"font-weight:600\">${reqHeader.approver}</td>\n    </tr>\n  </table>\n</div>\n\n<!-- TABEL HASIL VALIDASI -->\n<div style=\"font-size:15px;font-weight:700;color:#4A235A;margin-bottom:12px;display:flex;align-items:center;gap:8px;\">\n  <span style=\"background:#4A235A;color:#fff;border-radius:50%;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;\">✓</span>\n  BARANG TERVALIDASI — HANYA ITEM YANG ADA DI MANDATORY (${finalData.length} item)\n</div>\n\n<table border=\"1\" cellpadding=\"8\" style=\"border-collapse:collapse;width:100%;text-align:center;border:1px solid #ddd;margin-bottom:30px;background:#fff;\">\n<thead>\n  <tr style=\"background:#F5EEF8;color:#4A235A;font-weight:700;border-bottom:2px solid #4A235A;\">\n    <th style=\"width:3%\">No</th>\n    <th style=\"width:10%\">Item Code</th>\n    <th style=\"width:28%;text-align:left\">Kategori Master &amp; Detail Dokumen</th>\n    <th style=\"width:5%\">ROB</th>\n    <th style=\"width:6%\">REQ</th>\n    <th style=\"width:8%\">NET REQ</th>\n    <th style=\"width:9%\">MAX REQ</th>\n    <th style=\"width:7%\">+SPARE</th>\n    <th style=\"width:8%\">MAX ALLOWED</th>\n    <th style=\"width:16%\">FINAL QTY &amp; STATUS</th>\n  </tr>\n</thead>\n<tbody>\n`;\n\nfinalData.forEach(row => {\n    const c = colorMap[row.row_color] || colorMap.green;\n    html += `\n  <tr style=\"border-bottom:1px solid #eee;\">\n    <td style=\"color:#888\">${row.no}</td>\n    <td style=\"color:#555;font-size:11px\">${row.item_code}</td>\n    <td style=\"text-align:left;border-color:#eee;\">\n      <strong style=\"font-size:13px;color:#333\">${row.master_name}</strong>\n      <span style=\"font-size:10px;background:#F5EEF8;color:#4A235A;padding:2px 6px;border-radius:4px;margin-left:6px;border:1px solid #ebdcf5;\">Mandatory</span><br>\n      <div style=\"margin-top:6px;font-size:11px;color:#555;background:#fafafa;padding:5px 8px;border-left:3px solid #4A235A;border-radius:0 4px 4px 0;\">\n        <span style=\"color:#888\">Req:</span> <strong>${row.req_name}</strong><br>\n        <span style=\"color:#888\">Part No:</span> ${row.req_maker} &nbsp;|&nbsp; <span style=\"color:#888\">Subsystem:</span> ${row.req_subsystem}\n      </div>\n    </td>\n    <td style=\"font-weight:600;color:#555\">${row.rob}</td>\n    <td style=\"font-weight:700;font-size:14px;background:${c.bg};color:${c.text}\">${row.qty_req}</td>\n    <td style=\"font-weight:700;font-size:14px;color:#4A235A\">${row.net_req}</td>\n    <td style=\"color:#555\">${row.max_req}</td>\n    <td style=\"color:#555\">${row.spare}</td>\n    <td style=\"color:#555;font-weight:600\">${row.max_allowed}</td>\n    <td style=\"background:#fafafa;vertical-align:middle;\">\n      <div style=\"font-weight:700;font-size:28px;color:${c.text};margin-bottom:4px\">${row.final_qty}</div>\n      <div style=\"font-size:11px;color:#555;background:#fff;padding:5px 7px;border-radius:5px;border:1px solid #e0e0e0;text-align:left;line-height:1.5\">${row.logic_label}</div>\n    </td>\n  </tr>`;\n});\n\nhtml += `</tbody></table>\n\n<!-- TABEL RUNNING HOURS (BUKTI PENDUKUNG) -->\n<div style=\"font-size:15px;font-weight:700;color:#4A235A;margin-bottom:12px;border-bottom:2px solid #eee;padding-bottom:6px;\">\n  📋 RUNNING HOURS — BUKTI PENDUKUNG PER ITEM (${finalData.length} item)\n</div>\n<table style=\"width:100%;border-collapse:collapse;border:none;\"><tr>`;\n\nlet count = 0;\nfinalData.forEach(item => {\n    if (count > 0 && count % 2 === 0) html += `</tr><tr>`;\n\n    let subTable = `\n<table border=\"1\" cellpadding=\"6\" style=\"border-collapse:collapse;width:100%;border:1px solid #e0e0e0;background:#fff;border-radius:6px;overflow:hidden;\">\n  <tr style=\"background:#fafafa;border-bottom:1px solid #e0e0e0;\">\n    <th colspan=\"3\" style=\"text-align:left;padding:10px 12px;line-height:1.5\">\n      <div style=\"font-size:13px;font-weight:700;color:#333\">${item.master_name}</div>\n      <div style=\"font-size:11px;color:#555;margin-top:3px\">Req: ${item.req_name} &nbsp;|&nbsp; <span style=\"color:#888\">Part:</span> ${item.req_maker}</div>\n      ${item.rh_found\n        ? `<div style=\"font-size:10px;color:#1e8449;margin-top:4px;font-weight:600\">✅ RH Ditemukan: ${item.rh_desc}</div>`\n        : `<div style=\"font-size:10px;color:#b9770e;margin-top:4px;font-weight:600\">⚠️ RH tidak ditemukan untuk komponen ini</div>`\n      }\n    </th>\n  </tr>\n  <tr style=\"font-weight:600;font-size:11px;background:#F5EEF8;color:#4A235A;\">\n    <td>SILINDER</td><td>JAM KERJA (hrs)</td><td>KETERANGAN</td>\n  </tr>`;\n\n    if (item.rh_found) {\n        item.rh_summary.forEach(cyl => {\n            const isUnread = cyl.hours === null;\n            const rowStyle = isUnread\n                ? \"background:#fcf3cf;color:#9c640c;font-weight:600;\"\n                : \"color:#555;\";\n            subTable += `\n  <tr style=\"font-size:12px;${rowStyle}border-color:#eee;\">\n    <td style=\"font-weight:600;color:#333\">CYL ${cyl.cyl}</td>\n    <td>${isUnread ? '<span style=\"font-weight:600\">! (Tidak terbaca)</span>' : cyl.hours}</td>\n    <td>${isUnread ? '⚠️ CEK' : (cyl.hours > 0 ? 'Tercatat' : '0 hrs')}</td>\n  </tr>`;\n        });\n    } else {\n        subTable += `\n  <tr><td colspan=\"3\" style=\"padding:10px;color:#888;font-style:italic;text-align:center;\">\n    Nama komponen di PDF RH tidak cocok dengan kategori master ini.<br>\n    Cek normalisasi nama di prompt Analyze Running Hours.\n  </td></tr>`;\n    }\n\n    subTable += `</table>`;\n    html += `<td style=\"width:50%;padding:10px;padding-left:0;vertical-align:top;border:none;\">${subTable}</td>`;\n    count++;\n});\n\nif (count % 2 !== 0) html += `<td style=\"width:50%;border:none;\"></td>`;\nhtml += `</tr></table></div>`;\n\n// ─── STEP 4: Split HTML untuk Google Sheets (max 40.000 char per cell) ───\nconst chunkSize = 40000;\nconst chunks = {};\nfor (let i = 0; i < 10; i++) {\n    chunks[`html${i+1}`] = html.substring(i * chunkSize, (i+1) * chunkSize);\n}\n\nreturn [{\n    json: {\n        status: \"Sukses\",\n        total_matched: finalData.length,\n        ...chunks\n    }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        -336
+      ],
+      "id": "736f8eee-ef73-48e1-a480-9b2840930833",
+      "name": "Code in JavaScript",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "numberInputs": 4,
+        "mode": "multiplex"
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "d6c8bd8c-e876-4e3c-811d-17ae1be9a299",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-2.5-pro",
+          "mode": "list",
+          "cachedResultName": "models/gemini-2.5-pro"
+        },
+        "text": "Kamu adalah Data Engineer spesialis dokumen kapal. Ekstrak SEMUA informasi dari dokumen Requisition Form ini secara teliti dari halaman pertama sampai terakhir.\n\nTANGKAP INFORMASI HEADER:\n- vessel, department, approver, date\n\nTANGKAP DAFTAR BARANG (TABEL):\nUntuk setiap item, ambil: no, item_name, maker (kode part), subsystem, rob, req (dari kolom Appr jika ada, kalau tidak ada pakai kolom Req).\n\nTUGAS KRITIS — ASSIGN master_category:\nPerusahaan memiliki daftar \"Kategori Master Mandatory\" berikut. Untuk SETIAP item yang kamu ekstrak, analisa secara teknis kelautan: apakah item ini merupakan bagian utama, alias, atau komponen overhaul dari salah satu kategori di bawah?\n\nDaftar Kategori Master (gunakan PERSIS nama ini, case-sensitive huruf besar semua):\n1.  CYLINDER HEAD / COVER\n2.  PISTON CROWN & SKIRT\n3.  PISTON RING\n4.  CYLINDER LINER\n5.  EXHAUST VALVE\n6.  INLET VALVE\n7.  PLUNGER\n8.  NOZZLE\n9.  CRANKPIN BEARING\n10. MAIN BEARING\n11. CONNECTING ROD\n12. CONNECTING ROD BOLT\n13. CRANKPIN BOLT\n14. COOLING JACKET HEAD\n15. COOLING JACKET LINER\n16. THRUST BEARING\n17. BOLT FOR PISTON CROWN\n\nContoh penalaran yang benar:\n- \"COOLING JACKET PC\" di subsystem \"CYLINDER COVER\" → COOLING JACKET HEAD\n- \"PISTON RING PC\" → PISTON RING\n- \"PISTON CROWN PC\" → PISTON CROWN & SKIRT\n- \"PISTON SKIRT PC\" → PISTON CROWN & SKIRT\n- \"PUMP BARREL, COMPLETE\" di subsystem \"FUEL PUMP\" → PLUNGER\n- \"SPINDLE GUIDE, COMPLETE\" di subsystem \"FUEL VALVE\" → NOZZLE\n- \"NON-RETURN VALVE, COMPLETE\" di subsystem \"FUEL VALVE\" → NOZZLE\n- \"THRUST SPINDLE\" di subsystem \"FUEL VALVE\" → NOZZLE\n- \"SEALING RING\" di subsystem \"EXHAUST VALVE\" → EXHAUST VALVE\n- Semua item di subsystem \"PISTON ROD STUFFING BOX\" → BUKAN kategori master → \"-\"\n- O-Ring, Gasket, Spring, Sealing Ring umum → \"-\" KECUALI subsystem-nya menunjuk ke kategori master\n\nIsi field \"master_category\" dengan NAMA PERSIS dari kategori di atas. Jika tidak cocok dengan satupun, isi \"-\".\n\nOutput JSON WAJIB PERSIS seperti ini (tanpa ```json, tanpa penjelasan):\n{\n  \"vessel\": \"Nama Kapal\",\n  \"department\": \"Nama Departemen\",\n  \"approver\": \"Nama Approver\",\n  \"date\": \"Tanggal\",\n  \"extracted_items\": [\n    {\n      \"no\": \"1\",\n      \"item_name\": \"COOLING JACKET\",\n      \"maker\": \"P90101-0163-114\",\n      \"subsystem\": \"CYLINDER COVER\",\n      \"rob\": 2.00,\n      \"req\": 1.00,\n      \"master_category\": \"COOLING JACKET HEAD\"\n    },\n    {\n      \"no\": \"2\",\n      \"item_name\": \"O-RING biasa\",\n      \"maker\": \"P90910-0145-089\",\n      \"subsystem\": \"FUEL VALVE\",\n      \"rob\": 5.00,\n      \"req\": 12.00,\n      \"master_category\": \"-\"\n    }\n  ]\n}",
+        "inputType": "binary",
+        "binaryPropertyName": "Requisition_Form",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -688,
+        -528
+      ],
+      "id": "34ee31e0-cf61-4d80-bce8-75b38049ae0d",
+      "name": "Analyze Requisition",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "Qe0qv7Wlz52yn1LO",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-2.5-pro",
+          "mode": "list",
+          "cachedResultName": "models/gemini-2.5-pro"
+        },
+        "text": "Kamu adalah Data Engineer kelautan senior. Tugasmu mengekstrak data Running Hours (Jam Kerja Sejak Overhaul Terakhir) dari dokumen PDF laporan kapal.\n\nDETEKSI FORMAT DOKUMEN:\nDokumen kapal memiliki 2 format utama:\n\nFORMAT A (Komponen sebagai KOLOM, Nomor Silinder sebagai BARIS):\n- Jam kerja ada di kolom \"Since Last Overhaul\" atau \"Last Done\"\n- Waspada: sel mungkin berisi teks campuran seperti \"Ring BEKAS 1178.6\" → ambil angkanya saja (1178.6)\n\nFORMAT B (Komponen sebagai BARIS, Nomor Silinder sebagai KOLOM) — seperti form M-28F:\n- Di bawah nama komponen ada sub-baris \"Hours since last done (Hrs)\"\n- Ambil angka dari baris \"Hours since last done\" SAJA — ABAIKAN baris tanggal!\n\nATURAN PEMBERSIHAN ANGKA:\n1. JANGAN ambil format tanggal (15/06/25, 3/8/2020) — itu bukan Running Hours!\n2. Angka ribuan seperti \"14,553\" atau \"14.553\" → jadikan \"14553\" (hapus pemisah ribuan)\n3. Desimal murni seperti \"1178.6\" → biarkan tetap \"1178.6\"\n4. Sel kosong, strip (-), N/A, tidak terbaca → isi dengan string \"!\"\n5. Teks seperti \"6 month\", \"N/A\", \"tidak ada record\" → isi dengan \"!\"\n\nNORMALISASI NAMA KOMPONEN (SANGAT KRITIS):\nSetelah ekstrak, WAJIB normalisasi field \"deskripsi\" ke nama master berikut.\nJika nama di PDF adalah alias atau variasi, GANTI dengan nama master yang PERSIS sama:\n\nPDF Name → Master Name:\n- \"Cyl Head Overhaul\", \"Cylinder Head O/H\", \"Cyl. Head\" → CYLINDER HEAD / COVER\n- \"Jacket Cooling Head\", \"Cool. Jacket Head\", \"Cooling Jacket (Head)\" → COOLING JACKET HEAD\n- \"Jacket Cooling Liner\", \"Cool. Jacket Liner\", \"Cooling Jacket (Liner)\" → COOLING JACKET LINER\n- \"Exhaust Valve\", \"Exh. Valve\", \"Exh Valve O/H\", \"EX VALVE\", \"Exhaust Valve Actuator\" → EXHAUST VALVE\n- \"Inlet Valve\", \"In. Valve\", \"Suction Valve\" → INLET VALVE\n- \"Piston Rings\", \"Piston Ring\", \"Ring Piston\" → PISTON RING\n- \"Piston Crown\", \"Piston Crown O/H\", \"Piston Overhaul\" → PISTON CROWN & SKIRT\n- \"Cylinder Liner Renewal\", \"Liner\", \"Cyl. Liner\" → CYLINDER LINER\n- \"Fuel Injection Valve Overhaul\", \"Fuel Valve O/H\", \"Injector O/H\", \"Atomizer\" → NOZZLE\n- \"Fuel Pump Overhaul\", \"Fuel Pump\", \"F/Pump O/H\", \"Pump Barrel\" → PLUNGER\n- \"Stuffing Box\", \"Piston Rod Stuffing Box\" → STUFFING BOX\n- \"Crankpin Bearing Renewal\", \"Crank Pin Bearing\" → CRANKPIN BEARING\n- \"Main Bearing Renewal\", \"Main Brg\" → MAIN BEARING\n- \"Crosshead Bearing\" → CROSSHEAD BEARING\n- \"Air Start Valve\", \"Starting Valve\" → AIR START VALVE\n- \"Crank Web Deflection\" → CRANK WEB DEFLECTION\n- Jika tidak cocok dengan daftar di atas → biarkan nama as-is\n\nOutput WAJIB JSON ARRAY MURNI, tanpa ```json, tanpa penjelasan apapun:\n[\n  { \"no\": \"1\", \"deskripsi\": \"CYLINDER HEAD / COVER\", \"cyl_1\": 1264, \"cyl_2\": 12815, \"cyl_3\": 8859, \"cyl_4\": 8860, \"cyl_5\": 348, \"cyl_6\": 915 },\n  { \"no\": \"2\", \"deskripsi\": \"COOLING JACKET HEAD\", \"cyl_1\": 1264, \"cyl_2\": 12815, \"cyl_3\": 8859, \"cyl_4\": 8860, \"cyl_5\": 348, \"cyl_6\": 915 },\n  { \"no\": \"10\", \"deskripsi\": \"NOZZLE\", \"cyl_1\": 2715, \"cyl_2\": 255, \"cyl_3\": 4676, \"cyl_4\": 4281, \"cyl_5\": 348, \"cyl_6\": 915 }\n]",
+        "inputType": "binary",
+        "binaryPropertyName": "Running_Hours_Report",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -672,
+        -112
+      ],
+      "id": "19590fbb-96a0-47cd-9821-cafff019d7e0",
+      "name": "Analyze Running Hours",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "Qe0qv7Wlz52yn1LO",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "277b56f1-5761-412a-9be5-86298d5aa5de",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1312,
+        -336
+      ],
+      "id": "ade8f3af-26a9-4919-ba26-2887d8a04a38",
+      "name": "Webhook",
+      "webhookId": "277b56f1-5761-412a-9be5-86298d5aa5de"
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "searchMethod": "query",
+        "queryString": "=name = 'Mandatory_{{ $json.body.engine_type }}.xlsx'",
+        "filter": {},
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -912,
+        -320
+      ],
+      "name": "Cari File ID Mandatory",
+      "id": "79f112ff-7e90-4a0b-89e1-39e8301b6303",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "a0rSNrm8Ywox1qPk",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -720,
+        -320
+      ],
+      "name": "Download Mandatory Excel",
+      "id": "314ab45b-fe94-428d-be36-bef2c4e9fc18",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "a0rSNrm8Ywox1qPk",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -544,
+        -320
+      ],
+      "id": "6c80df72-079e-476a-b8cc-ee746dbcb47d",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1v6holLb1-n0rmefWqji5JrMW4t0C-USsFD_t2yloEX0",
+          "mode": "list",
+          "cachedResultName": "DB_Antrean_Logistik",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1v6holLb1-n0rmefWqji5JrMW4t0C-USsFD_t2yloEX0/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1v6holLb1-n0rmefWqji5JrMW4t0C-USsFD_t2yloEX0/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "job_id": "={{ $('Webhook').first().json.body.job_id }}",
+            "html_part1": "={{ $json.html1 }}",
+            "html_part2": "={{ $json.html2 }}",
+            "html_part3": "={{ $json.html3 }}",
+            "html_part4": "={{ $json.html4 }}",
+            "html_part5": "={{ $json.html5 }}",
+            "html_part6": "={{ $json.html6 }}",
+            "html_part7": "={{ $json.html7 }}",
+            "html_part8": "={{ $json.html8 }}",
+            "html_part9": "={{ $json.html9 }}",
+            "html_part10": "={{ $json.html10 }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "job_id",
+              "displayName": "job_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "html_part1",
+              "displayName": "html_part1",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part2",
+              "displayName": "html_part2",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part3",
+              "displayName": "html_part3",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part4",
+              "displayName": "html_part4",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part5",
+              "displayName": "html_part5",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part6",
+              "displayName": "html_part6",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part7",
+              "displayName": "html_part7",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part8",
+              "displayName": "html_part8",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part9",
+              "displayName": "html_part9",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "html_part10",
+              "displayName": "html_part10",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        208,
+        -320
+      ],
+      "id": "5c2cc179-0bbb-4556-b8a5-2956ebfb67d6",
+      "name": "Append row in sheet",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "hvy3nat33uQPVzW7",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: Prepare PDF Cut List\n// Mengambil hasil Analyze Items Code dan menyiapkan daftar halaman yang perlu di-cut\n\nconst inputs = $input.all();\nconst engineType = $('Webhook').first().json.body.engine_type || 'UNKNOWN';\n\nlet itemsData = [];\n\ninputs.forEach(input => {\n  let json = input.json;\n  let dataArray = [];\n\n  if (json.content && json.content.parts && json.content.parts[0]) {\n    try {\n      let cleanText = json.content.parts[0].text.replace(/```json/g, '').replace(/```/g, '').trim();\n      dataArray = JSON.parse(cleanText);\n    } catch(e) {}\n  } else if (Array.isArray(json)) {\n    dataArray = json;\n  }\n\n  if (Array.isArray(dataArray)) {\n    itemsData = itemsData.concat(dataArray);\n  }\n});\n\n// Deduplikasi halaman & format nama file\nconst uniquePages = [...new Set(itemsData.map(i => i.page).filter(p => p))];\nconst sortedPages = uniquePages.sort((a, b) => a - b);\n\nconst pageList = sortedPages.map(page => ({\n  page_number: page,\n  file_name: `${String(page).padStart(3, '0')} - ${engineType.toUpperCase().replace(/\\s+/g, '_')}`,\n  engine_type: engineType,\n  items_on_page: itemsData.filter(i => i.page === page)\n}));\n\nif (pageList.length === 0) {\n  return [{ json: { PESAN_ERROR: 'Tidak ada halaman terdeteksi dari Manual Book!' } }];\n}\n\nreturn pageList.map(p => ({ json: p }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2304,
+        80
+      ],
+      "id": "99061bbe-816a-4b8f-a7e7-2a980e32f712",
+      "name": "Prepare PDF Cut List"
+    },
+    {
+      "parameters": {
+        "url": "https://api.pdf.co/v1/pdf/split",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "it.gajahmada10@gmail.com_encWYFW8u47AVlvN9xLFVxmNifH2G1W3vX3rlpOQFEcLtRzGD51HZnYEh6k46I9y"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "url",
+              "value": "={{ $('Webhook').first().json.body.manual_book_url }}"
+            },
+            {
+              "name": "pages",
+              "value": "={{ $json.page_number }}"
+            },
+            {
+              "name": "name",
+              "value": "={{ $json.file_name }}.pdf"
+            },
+            {
+              "name": "async",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -2064,
+        80
+      ],
+      "id": "1ca61896-d5e2-469d-b25a-a44a9f3111dc",
+      "name": "Auto-Cut PDF per Page",
+      "notes": "Gunakan PDF.co API (ada free tier 100 halaman/hari). Ganti x-api-key dengan API key kamu dari app.pdf.co"
+    },
+    {
+      "parameters": {
+        "name": "={{ $('Prepare PDF Cut List').item.json.file_name }}.pdf",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "GANTI_DENGAN_FOLDER_ID_DRIVE",
+          "mode": "id"
+        },
+        "options": {
+          "simplifyOutput": true
+        }
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -1824,
+        80
+      ],
+      "id": "21d4c728-b5e6-4790-8fe9-4d729c55d9cc",
+      "name": "Upload Page ke Drive",
+      "retryOnFail": true,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "a0rSNrm8Ywox1qPk",
+          "name": "Google Drive account"
+        }
+      },
+      "notes": "Ganti FOLDER_ID dengan ID folder tujuan di Google Drive"
+    },
+    {
+      "parameters": {
+        "resource": "document",
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-2.5-pro",
+          "mode": "list",
+          "cachedResultName": "models/gemini-2.5-pro"
+        },
+        "text": "Kamu adalah Data Engineer ahli dokumentasi teknik kapal. Tugasmu mengekstrak data sparepart dari halaman Manual Book mesin ini.\n\nEKSTRAK DATA BERIKUT DARI SETIAP ITEM YANG TERLIHAT:\n- item_code   : Kode item internal (biasanya format alfanumerik, contoh: ME-001, 90-234)\n- part_number : Nomor part dari pabrikan (biasanya ada di kolom \"Part No\" atau \"Ref No\")\n- page        : Nomor halaman di manual book tempat item ini ditemukan\n- qty         : Jumlah/kuantitas item (ambil dari kolom \"Qty\" atau \"Quantity\")\n- description : Nama/deskripsi singkat item tersebut\n\nATURAN KRITIS:\n1. Jika item_code tidak ditemukan, isi dengan \"-\"\n2. Jika part_number tidak ditemukan, isi dengan \"-\"\n3. Jika qty tidak ditemukan atau 0, tetap sertakan itemnya dengan qty: 0\n4. Nomor halaman WAJIB diisi, ambil dari footer/header dokumen atau perkirakan urutannya\n5. Output HANYA JSON array murni, TANPA ```json dan TANPA penjelasan apapun\n\nFormat output WAJIB:\n[\n  {\n    \"item_code\": \"ME-001\",\n    \"part_number\": \"503-90801\",\n    \"page\": 45,\n    \"qty\": 6,\n    \"description\": \"Exhaust Valve Spindle\"\n  },\n  {\n    \"item_code\": \"-\",\n    \"part_number\": \"MAN-2231-A\",\n    \"page\": 46,\n    \"qty\": 1,\n    \"description\": \"Piston Crown\"\n  }\n]",
+        "inputType": "binary",
+        "binaryPropertyName": "Manual_Book",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -2576,
+        80
+      ],
+      "id": "45baf17f-fc07-4199-b6b6-c94ffdff7534",
+      "name": "Analyze Items Code1",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "Qe0qv7Wlz52yn1LO",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "id": "pn-index-http-001",
+      "name": "Get PN Index",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        460,
+        520
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://raw.githubusercontent.com/itgajahmada10/spb-waruna/main/pn_index/pn_index_ME_6N330.json",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Requisition": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Running Hours": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Analyze Requisition",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Cari File ID Mandatory",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Analyze Running Hours",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cari File ID Mandatory": {
+      "main": [
+        [
+          {
+            "node": "Download Mandatory Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Mandatory Excel": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Prepare PDF Cut List": {
+      "main": [
+        [
+          {
+            "node": "Auto-Cut PDF per Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-Cut PDF per Page": {
+      "main": [
+        [
+          {
+            "node": "Upload Page ke Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Items Code1": {
+      "main": [
+        [
+          {
+            "node": "Prepare PDF Cut List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get PN Index": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "4fc5c859-3977-4531-abb7-4ce97bd16978",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "57f8f432cfa9fa84f98b95363c7b5daaab50e11d4b1794dcd6290279d73dd6ce"
+  },
+  "id": "v4m_YpWxxef6_wcQpBMID",
+  "tags": []
+}
